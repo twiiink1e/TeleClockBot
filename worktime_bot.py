@@ -1,332 +1,296 @@
+#!/usr/bin/env python3
 """
-Telegram Attendance Bot
------------------------
-Commands:
-  /in      - Clock in
-  /out     - Clock out
-  /break   - Start break
-  /resume  - End break
-  /status  - View current status
+Work Duration Calculator Telegram Bot
+Calculate working hours from clock-in, clock-out, and break time.
 
-Install:
+Setup:
   pip install python-telegram-bot
 
 Run:
-  BOT_TOKEN=your_token_here python worktime_bot.py
+  BOT_TOKEN=<your_token> python work_duration_bot.py
+  OR set BOT_TOKEN in the script below.
 """
 
 import os
+import re
 import logging
-from datetime import datetime
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes
-from zoneinfo import ZoneInfo
-
-logging.basicConfig(level=logging.INFO)
-
-# In-memory store: { user_id: { ...session data } }
-sessions: dict = {}
-
-KEYBOARD = ReplyKeyboardMarkup(
-    [["🟢 Clock In", "🔴 Clock Out"], ["☕ Break", "▶ Resume"], ["📋 Status"]],
-    resize_keyboard=True,
+from datetime import datetime, timedelta
+from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    ConversationHandler,
+    ContextTypes,
+    filters,
 )
 
-DIVIDER = "─" * 24
+# ── Config ────────────────────────────────────────────────────────────────────
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is not set.")
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+# Conversation states
+CLOCK_IN, CLOCK_OUT, BREAK_TIME = range(3)
+
+# Accepted time formats
+TIME_FORMATS = ["%H:%M", "%H.%M", "%I:%M %p", "%I:%M%p", "%I%p"]
+
+CANCEL_KEYBOARD = ReplyKeyboardMarkup([["❌ Cancel"]], resize_keyboard=True)
 
 
-def now() -> datetime:
-    return datetime.now(ZoneInfo("Asia/Phnom_Penh"))
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+def parse_time(text: str) -> datetime | None:
+    """Try parsing a time string with multiple formats."""
+    text = text.strip()
+    for fmt in TIME_FORMATS:
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
 
 
-def fmt_time(dt: datetime) -> str:
-    return dt.strftime("%I:%M %p")
+def parse_break(text: str) -> int | None:
+    """
+    Parse break duration. Accepts:
+      - Plain number: minutes  (e.g. "30")
+      - "Xh Ym" or "Xh"       (e.g. "1h 15m", "1h")
+      - "Xm"                  (e.g. "45m")
+      - "0" or "no" / "none"  (no break)
+    Returns total minutes or None on failure.
+    """
+    text = text.strip().lower()
+    if text in ("0", "no", "none", "-"):
+        return 0
+
+    # e.g. "1h 30m", "1h", "30m"
+    hm = re.fullmatch(r"(?:(\d+)h\s*)?(?:(\d+)m)?", text)
+    if hm and (hm.group(1) or hm.group(2)):
+        h = int(hm.group(1) or 0)
+        m = int(hm.group(2) or 0)
+        return h * 60 + m
+
+    # plain integer → minutes
+    if text.isdigit():
+        return int(text)
+
+    return None
 
 
-def fmt_date(dt: datetime) -> str:
-    return dt.strftime("%A, %d %b %Y")
-
-
-def dur_str(seconds: float) -> str:
-    seconds = int(seconds)
-    h, r = divmod(seconds, 3600)
-    m, s = divmod(r, 60)
+def format_duration(total_minutes: float) -> str:
+    """Return a human-friendly duration string."""
+    total_minutes = int(total_minutes)
+    h, m = divmod(abs(total_minutes), 60)
+    sign = "-" if total_minutes < 0 else ""
+    if h and m:
+        return f"{sign}{h}h {m}m"
     if h:
-        return f"{h}h {m:02d}m {s:02d}s"
-    if m:
-        return f"{m}m {s:02d}s"
-    return f"{s}s"
+        return f"{sign}{h}h"
+    return f"{sign}{m}m"
 
 
-def dur_dec(seconds: float) -> str:
-    return f"{seconds / 3600:.2f} hrs"
+def decimal_hours(minutes: float) -> str:
+    """Return minutes as decimal hours, e.g. 8h 15m → 8.25 h."""
+    return f"{minutes / 60:.2f} h"
 
 
-def get_session(user_id: int) -> dict:
-    if user_id not in sessions:
-        sessions[user_id] = {
-            "clocked_in": False,
-            "clock_in_time": None,
-            "clock_out_time": None,
-            "on_break": False,
-            "break_start": None,
-            "total_break": 0.0,
-        }
-    return sessions[user_id]
+def build_summary(clock_in: datetime, clock_out: datetime, break_min: int) -> str:
+    """Compose the result message."""
+    today = datetime.now().strftime("%A, %d %B %Y")
 
+    raw_minutes = (clock_out - clock_in).total_seconds() / 60
+    work_minutes = raw_minutes - break_min
 
-def net_seconds(s: dict) -> float:
-    if not s["clock_in_time"]:
-        return 0.0
-    end = s["clock_out_time"] or now()
-    gross = (end - s["clock_in_time"]).total_seconds()
-    brk = s["total_break"]
-    if s["on_break"] and s["break_start"]:
-        brk += (now() - s["break_start"]).total_seconds()
-    return max(0.0, gross - brk)
+    # Overtime vs under (vs 8-hour standard)
+    standard = 8 * 60
+    diff = work_minutes - standard
+    diff_label = (
+        f"🔺 +{format_duration(diff)} overtime"
+        if diff > 0
+        else f"🔻 {format_duration(diff)} under 8 h"
+        if diff < 0
+        else "✅ Exactly 8 h"
+    )
 
-
-def status_text(s: dict) -> str:
-    if not s["clock_in_time"]:
-        return (
-            "╔══════════════════════╗\n"
-            "║    No Active Session     ║\n"
-            "╚══════════════════════╝\n\n"
-            "You haven't clocked in yet\\.\n"
-            "Tap *🟢 Clock In* to start your day\\!"
-        )
-
-    net = net_seconds(s)
-    brk = s["total_break"]
-    if s["on_break"] and s["break_start"]:
-        brk += (now() - s["break_start"]).total_seconds()
-
-    # Status badge
-    if s["on_break"]:
-        badge = "☕  ON BREAK"
-    elif s["clocked_in"]:
-        badge = "🟢  WORKING"
-    else:
-        badge = "⚪  CLOCKED OUT"
-
-    lines = [
-        f"*{badge}*",
-        f"`{DIVIDER}`",
-        f"📅  {fmt_date(s['clock_in_time'])}",
-        f"`{DIVIDER}`",
-        f"🕐  *Clock In*    `{fmt_time(s['clock_in_time'])}`",
-    ]
-
-    if s["clock_out_time"]:
-        lines.append(f"🕔  *Clock Out*   `{fmt_time(s['clock_out_time'])}`")
-
-    if brk:
-        lines.append(f"☕  *Break*       `{dur_str(brk)}`")
-
-    lines += [
-        f"`{DIVIDER}`",
-        f"⏱  *Net Time*    `{dur_str(net)}`",
-        f"🔢  *Decimal*     `{dur_dec(net)}`",
-    ]
-
-    return "\n".join(lines)
+    return (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "🕐  *Work Duration Summary*\n"
+        f"📅  _{today}_\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"❇️  Clock-in  :  `{clock_in.strftime('%H:%M')}`\n"
+        f"⛔  Clock-out :  `{clock_out.strftime('%H:%M')}`\n"
+        f"☕  Break     :  `{format_duration(break_min)}`\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"⏱  Total shift  :  *{format_duration(raw_minutes)}*  `({decimal_hours(raw_minutes)})`\n"
+        f"💼  Work time    :  *{format_duration(work_minutes)}*  `({decimal_hours(work_minutes)})`\n"
+        f"{diff_label}\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
 
 
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
-async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    name = update.effective_user.first_name or "there"
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
-        f"👋 *Hey {name}\\!* Welcome to *WorkClock Bot*\\.\n\n"
-        f"`{DIVIDER}`\n"
-        "Here's what I can do:\n\n"
-        "🟢 `/in`  — Clock in\n"
-        "🔴 `/out`  — Clock out\n"
-        "☕ `/break`  — Start a break\n"
-        "▶️ `/resume`  — End your break\n"
-        "📋 `/status`  — View your summary\n\n"
-        f"`{DIVIDER}`\n"
-        "_Use the buttons below or type a command to get started\\._",
-        parse_mode="MarkdownV2",
-        reply_markup=KEYBOARD,
+        "👋 *Work Duration Calculator*\n\n"
+        "I'll help you calculate how long you worked.\n\n"
+        "Enter your *clock-in* time (e.g. `09:00` or `9am`):",
+        parse_mode="Markdown",
+        reply_markup=CANCEL_KEYBOARD,
     )
+    return CLOCK_IN
 
 
-async def cmd_in(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = get_session(uid)
+async def get_clock_in(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text == "❌ Cancel":
+        return await cancel(update, context)
 
-    if s["clocked_in"]:
+    t = parse_time(text)
+    if t is None:
         await update.message.reply_text(
-            "⚠️ *Already Clocked In*\n\n"
-            "You're already on the clock\\.\n"
-            "Use 🔴 `/out` when you're done\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=KEYBOARD,
+            "⚠️ Couldn't read that time. Try formats like `09:00`, `9.00`, or `9am`.",
+            parse_mode="Markdown",
         )
-        return
+        return CLOCK_IN
 
-    s.update({
-        "clocked_in": True,
-        "clock_in_time": now(),
-        "clock_out_time": None,
-        "on_break": False,
-        "break_start": None,
-        "total_break": 0.0,
-    })
+    context.user_data["clock_in"] = t
     await update.message.reply_text(
-        f"🟢 *Clocked In*\n\n"
-        f"`{DIVIDER}`\n"
-        f"🕐  `{fmt_time(s['clock_in_time'])}`\n"
-        f"📅  {fmt_date(s['clock_in_time'])}\n"
-        f"`{DIVIDER}`\n\n"
-        "_Have a productive day\\! 💪_",
-        parse_mode="MarkdownV2",
-        reply_markup=KEYBOARD,
+        f"✅ Clock-in: *{t.strftime('%H:%M')}*\n\nNow enter your *clock-out* time:",
+        parse_mode="Markdown",
+        reply_markup=CANCEL_KEYBOARD,
     )
+    return CLOCK_OUT
 
 
-async def cmd_out(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = get_session(uid)
+async def get_clock_out(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text == "❌ Cancel":
+        return await cancel(update, context)
 
-    if not s["clocked_in"]:
+    t = parse_time(text)
+    if t is None:
         await update.message.reply_text(
-            "⚠️ *Not Clocked In*\n\n"
-            "No active session found\\.\n"
-            "Use 🟢 `/in` to start your day\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=KEYBOARD,
+            "⚠️ Couldn't read that time. Try `17:30`, `5.30pm`, etc.",
+            parse_mode="Markdown",
         )
-        return
+        return CLOCK_OUT
 
-    if s["on_break"]:
-        s["total_break"] += (now() - s["break_start"]).total_seconds()
-        s["on_break"] = False
-        s["break_start"] = None
+    clock_in: datetime = context.user_data["clock_in"]
 
-    s["clocked_in"] = False
-    s["clock_out_time"] = now()
+    # Handle overnight shift
+    if t <= clock_in:
+        t += timedelta(days=1)
 
-    await update.message.reply_text(
-        f"🔴 *Clocked Out* — Great work today\\!\n\n"
-        f"{status_text(s)}",
-        parse_mode="MarkdownV2",
-        reply_markup=KEYBOARD,
+    context.user_data["clock_out"] = t
+    duration_so_far = format_duration((t - clock_in).total_seconds() / 60)
+
+    break_keyboard = ReplyKeyboardMarkup(
+        [["0", "15m", "30m", "45m", "1h", "1h 30m"], ["❌ Cancel"]],
+        resize_keyboard=True,
     )
+    await update.message.reply_text(
+        f"✅ Clock-out: *{t.strftime('%H:%M')}*  _(shift: {duration_so_far})_\n\n"
+        "How long was your *break*?\nEnter minutes (`30`), or use shorthand (`1h 15m`). "
+        "Tap a quick option or type `0` for no break.",
+        parse_mode="Markdown",
+        reply_markup=break_keyboard,
+    )
+    return BREAK_TIME
 
 
-async def cmd_break(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = get_session(uid)
+async def get_break(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text == "❌ Cancel":
+        return await cancel(update, context)
 
-    if not s["clocked_in"]:
+    break_min = parse_break(text)
+    if break_min is None:
         await update.message.reply_text(
-            "⚠️ *Not Clocked In*\n\n"
-            "Clock in first with 🟢 `/in`\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=KEYBOARD,
+            "⚠️ Couldn't parse that. Try `30`, `45m`, `1h`, `1h 30m`, or `0` for no break.",
+            parse_mode="Markdown",
         )
-        return
+        return BREAK_TIME
 
-    if s["on_break"]:
-        await update.message.reply_text(
-            "⚠️ *Already On Break*\n\n"
-            "Use ▶️ `/resume` to end your current break\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=KEYBOARD,
-        )
-        return
+    clock_in: datetime = context.user_data["clock_in"]
+    clock_out: datetime = context.user_data["clock_out"]
 
-    s["on_break"] = True
-    s["break_start"] = now()
-    await update.message.reply_text(
-        f"☕ *Break Started*\n\n"
-        f"`{DIVIDER}`\n"
-        f"🕐  `{fmt_time(s['break_start'])}`\n"
-        f"`{DIVIDER}`\n\n"
-        "_Rest up\\! Use ▶️ `/resume` when you're back\\._",
-        parse_mode="MarkdownV2",
-        reply_markup=KEYBOARD,
+    summary = build_summary(clock_in, clock_out, break_min)
+
+    again_keyboard = ReplyKeyboardMarkup(
+        [["🔄 Calculate again"], ["❌ Done"]],
+        resize_keyboard=True,
     )
-
-
-async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = get_session(uid)
-
-    if not s["on_break"]:
-        await update.message.reply_text(
-            "⚠️ *Not On Break*\n\n"
-            "You're not currently on a break\\.",
-            parse_mode="MarkdownV2",
-            reply_markup=KEYBOARD,
-        )
-        return
-
-    brk_dur = (now() - s["break_start"]).total_seconds()
-    s["total_break"] += brk_dur
-    s["on_break"] = False
-    s["break_start"] = None
-
     await update.message.reply_text(
-        f"▶️ *Back to Work\\!*\n\n"
-        f"`{DIVIDER}`\n"
-        f"☕  Break lasted `{dur_str(brk_dur)}`\n"
-        f"🕐  Resumed at  `{fmt_time(now())}`\n"
-        f"`{DIVIDER}`\n\n"
-        "_Welcome back — let's get it\\! 🚀_",
-        parse_mode="MarkdownV2",
-        reply_markup=KEYBOARD,
+        summary,
+        parse_mode="Markdown",
+        reply_markup=again_keyboard,
     )
+    return ConversationHandler.END
 
 
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_user.id
-    s = get_session(uid)
+async def again(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Restart calculation from /start handler."""
+    return await start(update, context)
+
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
-        status_text(s),
-        parse_mode="MarkdownV2",
-        reply_markup=KEYBOARD,
+        "Cancelled. Type /start to try again.",
+        reply_markup=ReplyKeyboardRemove(),
     )
+    return ConversationHandler.END
 
 
-async def handle_keyboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle keyboard button presses (they send text, not commands)."""
-    text = update.message.text
-    if "Clock In" in text:
-        await cmd_in(update, ctx)
-    elif "Clock Out" in text:
-        await cmd_out(update, ctx)
-    elif "Break" in text:
-        await cmd_break(update, ctx)
-    elif "Resume" in text:
-        await cmd_resume(update, ctx)
-    elif "Status" in text:
-        await cmd_status(update, ctx)
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "*Work Duration Bot — Help*\n\n"
+        "• /start — begin a new calculation\n"
+        "• /help  — show this message\n\n"
+        "*Accepted time formats*\n"
+        "`09:00`  `9.00`  `9am`  `9:30pm`\n\n"
+        "*Accepted break formats*\n"
+        "`30` → 30 min  |  `1h` → 1 hour\n"
+        "`1h 30m` → 90 min  |  `0` → no break\n\n"
+        "Overnight shifts are handled automatically.",
+        parse_mode="Markdown",
+    )
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    token = os.environ.get("BOT_TOKEN")
-    if not token:
-        raise ValueError("Set BOT_TOKEN environment variable")
+    app = Application.builder().token(BOT_TOKEN).build()
 
-    app = Application.builder().token(token).build()
+    conv = ConversationHandler(
+        entry_points=[
+            CommandHandler("start", start),
+            MessageHandler(filters.Regex("^🔄 Calculate again$"), again),
+        ],
+        states={
+            CLOCK_IN:   [MessageHandler(filters.TEXT & ~filters.COMMAND, get_clock_in)],
+            CLOCK_OUT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, get_clock_out)],
+            BREAK_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_break)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            MessageHandler(filters.Regex("^❌"), cancel),
+        ],
+    )
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("in", cmd_in))
-    app.add_handler(CommandHandler("out", cmd_out))
-    app.add_handler(CommandHandler("break", cmd_break))
-    app.add_handler(CommandHandler("resume", cmd_resume))
-    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(conv)
+    app.add_handler(CommandHandler("help", help_cmd))
 
-    from telegram.ext import MessageHandler, filters
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_keyboard))
-
-    print("Bot running...")
-    app.run_polling()
+    logger.info("Bot is running…")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
 if __name__ == "__main__":
