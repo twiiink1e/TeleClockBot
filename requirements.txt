@@ -1,9 +1,2 @@
 python-telegram-bot
-    requests
-    ```
-
-### 3. Add and Commit
-Now, tell Git which files to track and save a "snapshot" of them:
-```bash
-git add .
-git commit -m "Initial bot setup"
+requests
