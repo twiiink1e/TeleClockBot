@@ -17,7 +17,7 @@ Run:
 
 import os
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 from zoneinfo import ZoneInfo
@@ -32,13 +32,15 @@ KEYBOARD = ReplyKeyboardMarkup(
     resize_keyboard=True,
 )
 
+DIVIDER = "─" * 24
+
 
 def now() -> datetime:
     return datetime.now(ZoneInfo("Asia/Phnom_Penh"))
 
 
 def fmt_time(dt: datetime) -> str:
-    return dt.strftime("%H:%M")
+    return dt.strftime("%I:%M %p")
 
 
 def fmt_date(dt: datetime) -> str:
@@ -50,9 +52,9 @@ def dur_str(seconds: float) -> str:
     h, r = divmod(seconds, 3600)
     m, s = divmod(r, 60)
     if h:
-        return f"{h}h {m}m {s}s"
+        return f"{h}h {m:02d}m {s:02d}s"
     if m:
-        return f"{m}m {s}s"
+        return f"{m}m {s:02d}s"
     return f"{s}s"
 
 
@@ -68,7 +70,7 @@ def get_session(user_id: int) -> dict:
             "clock_out_time": None,
             "on_break": False,
             "break_start": None,
-            "total_break": 0.0,  # seconds
+            "total_break": 0.0,
         }
     return sessions[user_id]
 
@@ -86,33 +88,46 @@ def net_seconds(s: dict) -> float:
 
 def status_text(s: dict) -> str:
     if not s["clock_in_time"]:
-        return "Not clocked in."
+        return (
+            "╔══════════════════════╗\n"
+            "║    No Active Session     ║\n"
+            "╚══════════════════════╝\n\n"
+            "You haven't clocked in yet\\.\n"
+            "Tap *🟢 Clock In* to start your day\\!"
+        )
 
-    date_str = fmt_date(s["clock_in_time"])
     net = net_seconds(s)
     brk = s["total_break"]
     if s["on_break"] and s["break_start"]:
         brk += (now() - s["break_start"]).total_seconds()
 
+    # Status badge
+    if s["on_break"]:
+        badge = "☕  ON BREAK"
+    elif s["clocked_in"]:
+        badge = "🟢  WORKING"
+    else:
+        badge = "⚪  CLOCKED OUT"
+
     lines = [
-        f"📅 {date_str}",
-        f"🕐 Clock in:  {fmt_time(s['clock_in_time'])}",
-    ]
-    if s["clock_out_time"]:
-        lines.append(f"🕐 Clock out: {fmt_time(s['clock_out_time'])}")
-    if brk:
-        lines.append(f"☕ Break:     {dur_str(brk)}")
-    lines += [
-        f"⏱ Net time:  {dur_str(net)}",
-        f"🔢 Decimal:   {dur_dec(net)}",
+        f"*{badge}*",
+        f"`{DIVIDER}`",
+        f"📅  {fmt_date(s['clock_in_time'])}",
+        f"`{DIVIDER}`",
+        f"🕐  *Clock In*    `{fmt_time(s['clock_in_time'])}`",
     ]
 
-    if s["on_break"]:
-        lines.append("\n☕ Currently on break")
-    elif s["clocked_in"]:
-        lines.append("\n🟢 Currently working")
-    else:
-        lines.append("\n⚪ Clocked out")
+    if s["clock_out_time"]:
+        lines.append(f"🕔  *Clock Out*   `{fmt_time(s['clock_out_time'])}`")
+
+    if brk:
+        lines.append(f"☕  *Break*       `{dur_str(brk)}`")
+
+    lines += [
+        f"`{DIVIDER}`",
+        f"⏱  *Net Time*    `{dur_str(net)}`",
+        f"🔢  *Decimal*     `{dur_dec(net)}`",
+    ]
 
     return "\n".join(lines)
 
@@ -120,15 +135,19 @@ def status_text(s: dict) -> str:
 # ── Handlers ──────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    name = update.effective_user.first_name or "there"
     await update.message.reply_text(
-        "👋 Welcome to *WorkClock Bot*!\n\n"
-        "Use the buttons or commands below:\n"
-        "/in — Clock in\n"
-        "/out — Clock out\n"
-        "/break — Start break\n"
-        "/resume — End break\n"
-        "/status — View summary",
-        parse_mode="Markdown",
+        f"👋 *Hey {name}\\!* Welcome to *WorkClock Bot*\\.\n\n"
+        f"`{DIVIDER}`\n"
+        "Here's what I can do:\n\n"
+        "🟢 `/in`  — Clock in\n"
+        "🔴 `/out`  — Clock out\n"
+        "☕ `/break`  — Start a break\n"
+        "▶️ `/resume`  — End your break\n"
+        "📋 `/status`  — View your summary\n\n"
+        f"`{DIVIDER}`\n"
+        "_Use the buttons below or type a command to get started\\._",
+        parse_mode="MarkdownV2",
         reply_markup=KEYBOARD,
     )
 
@@ -138,7 +157,13 @@ async def cmd_in(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_session(uid)
 
     if s["clocked_in"]:
-        await update.message.reply_text("⚠️ Already clocked in. Use /out first.")
+        await update.message.reply_text(
+            "⚠️ *Already Clocked In*\n\n"
+            "You're already on the clock\\.\n"
+            "Use 🔴 `/out` when you're done\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=KEYBOARD,
+        )
         return
 
     s.update({
@@ -150,9 +175,13 @@ async def cmd_in(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "total_break": 0.0,
     })
     await update.message.reply_text(
-        f"✅ Clocked in at *{fmt_time(s['clock_in_time'])}*\n"
-        f"📅 {fmt_date(s['clock_in_time'])}",
-        parse_mode="Markdown",
+        f"🟢 *Clocked In*\n\n"
+        f"`{DIVIDER}`\n"
+        f"🕐  `{fmt_time(s['clock_in_time'])}`\n"
+        f"📅  {fmt_date(s['clock_in_time'])}\n"
+        f"`{DIVIDER}`\n\n"
+        "_Have a productive day\\! 💪_",
+        parse_mode="MarkdownV2",
         reply_markup=KEYBOARD,
     )
 
@@ -162,7 +191,13 @@ async def cmd_out(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_session(uid)
 
     if not s["clocked_in"]:
-        await update.message.reply_text("⚠️ Not clocked in yet. Use /in to start.")
+        await update.message.reply_text(
+            "⚠️ *Not Clocked In*\n\n"
+            "No active session found\\.\n"
+            "Use 🟢 `/in` to start your day\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=KEYBOARD,
+        )
         return
 
     if s["on_break"]:
@@ -174,9 +209,9 @@ async def cmd_out(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s["clock_out_time"] = now()
 
     await update.message.reply_text(
-        f"🔴 Clocked out at *{fmt_time(s['clock_out_time'])}*\n\n"
+        f"🔴 *Clocked Out* — Great work today\\!\n\n"
         f"{status_text(s)}",
-        parse_mode="Markdown",
+        parse_mode="MarkdownV2",
         reply_markup=KEYBOARD,
     )
 
@@ -186,17 +221,32 @@ async def cmd_break(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_session(uid)
 
     if not s["clocked_in"]:
-        await update.message.reply_text("⚠️ Clock in first with /in.")
+        await update.message.reply_text(
+            "⚠️ *Not Clocked In*\n\n"
+            "Clock in first with 🟢 `/in`\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=KEYBOARD,
+        )
         return
+
     if s["on_break"]:
-        await update.message.reply_text("⚠️ Already on break. Use /resume to end it.")
+        await update.message.reply_text(
+            "⚠️ *Already On Break*\n\n"
+            "Use ▶️ `/resume` to end your current break\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=KEYBOARD,
+        )
         return
 
     s["on_break"] = True
     s["break_start"] = now()
     await update.message.reply_text(
-        f"☕ Break started at *{fmt_time(s['break_start'])}*",
-        parse_mode="Markdown",
+        f"☕ *Break Started*\n\n"
+        f"`{DIVIDER}`\n"
+        f"🕐  `{fmt_time(s['break_start'])}`\n"
+        f"`{DIVIDER}`\n\n"
+        "_Rest up\\! Use ▶️ `/resume` when you're back\\._",
+        parse_mode="MarkdownV2",
         reply_markup=KEYBOARD,
     )
 
@@ -206,16 +256,27 @@ async def cmd_resume(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_session(uid)
 
     if not s["on_break"]:
-        await update.message.reply_text("⚠️ Not on a break right now.")
+        await update.message.reply_text(
+            "⚠️ *Not On Break*\n\n"
+            "You're not currently on a break\\.",
+            parse_mode="MarkdownV2",
+            reply_markup=KEYBOARD,
+        )
         return
 
     brk_dur = (now() - s["break_start"]).total_seconds()
     s["total_break"] += brk_dur
     s["on_break"] = False
     s["break_start"] = None
+
     await update.message.reply_text(
-        f"▶️ Break ended. That was *{dur_str(brk_dur)}*. Back to work!",
-        parse_mode="Markdown",
+        f"▶️ *Back to Work\\!*\n\n"
+        f"`{DIVIDER}`\n"
+        f"☕  Break lasted `{dur_str(brk_dur)}`\n"
+        f"🕐  Resumed at  `{fmt_time(now())}`\n"
+        f"`{DIVIDER}`\n\n"
+        "_Welcome back — let's get it\\! 🚀_",
+        parse_mode="MarkdownV2",
         reply_markup=KEYBOARD,
     )
 
@@ -225,12 +286,13 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     s = get_session(uid)
     await update.message.reply_text(
         status_text(s),
+        parse_mode="MarkdownV2",
         reply_markup=KEYBOARD,
     )
 
 
 async def handle_keyboard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Handle the keyboard button presses (they send text, not commands)."""
+    """Handle keyboard button presses (they send text, not commands)."""
     text = update.message.text
     if "Clock In" in text:
         await cmd_in(update, ctx)
