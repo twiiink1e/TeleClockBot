@@ -20,6 +20,7 @@ import logging
 from datetime import datetime, timezone
 from telegram import Update, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
+from zoneinfo import ZoneInfo
 
 logging.basicConfig(level=logging.INFO)
 
@@ -33,7 +34,7 @@ KEYBOARD = ReplyKeyboardMarkup(
 
 
 def now() -> datetime:
-    return datetime.now(timezone.utc).astimezone()
+    return datetime.now(ZoneInfo("Asia/Phnom_Penh"))
 
 
 def fmt_time(dt: datetime) -> str:
