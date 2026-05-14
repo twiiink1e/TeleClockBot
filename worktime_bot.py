@@ -129,8 +129,7 @@ def build_summary(clock_in: datetime, clock_out: datetime, break_min: int) -> st
         f"⛔  Clock-out :  `{clock_out.strftime('%H:%M')}`\n"
         f"☕  Break     :  `{format_duration(break_min)}`\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"⏱  Total shift  :  *{format_duration(raw_minutes)}*  `({decimal_hours(raw_minutes)})`\n"
-        f"💼  Work time    :  *{format_duration(work_minutes)}*  `({decimal_hours(work_minutes)})`\n"
+        f"📊  Work time    :  *{format_duration(work_minutes)}*  `({decimal_hours(work_minutes)})`\n"
         f"{diff_label}\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
