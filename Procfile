@@ -1,1 +1,1 @@
-worker: python worktim_bot.py
+worker: python worktime_bot.py
